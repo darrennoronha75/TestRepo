@@ -1,0 +1,159 @@
+# WS-PDF Pre-generation Runbook — hash identity + automation configuration
+
+**Status:** v1.0 | **Created:** 2026-08-02 | **Parent:** [WS-PDF.md](WS-PDF.md) §3.3 / §9.8 AU5
+
+**Purpose.** The one-file guide to making scheduled PDF pre-generation actually hit: the rules that keep the scheduled path and the user's click producing **byte-identical specs**, the code files to add to `pdf-stack-actions`, the click-by-click Automate configuration, and the canary test that proves it. Worked example: the `one_pager` workload; the pattern repeats per workload.
+
+---
+
+## Part 1 — The hash-identity rules (what to consider so the paths can never diverge)
+
+**R1 — One builder, two callers, zero exceptions.** Each workload has exactly ONE `buildOnePagerSpec(project)` function in `pdf-stack-actions`. The user-facing submit action calls it; the scheduled batch action calls it. **Workshop never assembles `specJson`** — the frontend passes only subject parameters (the project object) into the wrapper action.
+
+**R2 — Request metadata never enters the spec.** `userId`, `trigger`, timestamps, request ids live on the `ReportRequest` row, NOT inside `specJson`. One user-specific or time-specific field inside the spec makes every hash unique and dedup permanently dead.
+
+**R3 — Canonicalize in one place only.** The builder returns a plain **object**. Only `dedupCore` turns it into bytes, via the shared `canonicalize()` (sorted keys, no whitespace variance) + `sha256` from `util.ts`. A hand-written `JSON.stringify` anywhere else in the repo is a red flag — grep for it in review.
+
+**R4 — Deterministic content assembly inside the builder.**
+- Sort every array by a stable key (projects by `projectId`, rows by date).
+- Fix number formatting at build time (e.g. round to 1 decimal ONCE, in the builder — never let the renderer and the builder round differently).
+- Dates as `YYYY-MM-DD` strings; no locale formatting anywhere.
+- Derived period labels computed by ONE helper (e.g. ISO week `2026-W31`) — "current week" computed two ways is a classic silent mismatch.
+- Omit-vs-null discipline: pick one (recommend: omit missing fields entirely) and keep it.
+
+**R5 — `SPEC_VERSION` lives in the builder.** It's part of the hashed spec, so bumping it intentionally invalidates every existing render (full re-render on next runs/clicks). That's the feature; just know it's the lever you're pulling.
+
+**R6 — Same data source, same read path.** Both callers run server-side in the same repo and read the same ontology objects at call time. Freshness asymmetry then only comes from *when* they run — which is exactly the dedup semantics you want (data changed since the nightly run → miss → fresh render).
+
+**R7 — Prove it, don't trust it.** The acceptance canary in Part 4 ends with: scheduled run, then frontend click → `deduped=true` and **zero** new `GeneratedReport` rows. Run it once per workload after any builder change.
+
+---
+
+## Part 2 — Code to add to `pdf-stack-actions` (TypeScript)
+
+Pseudocode-level per repo convention — substitute generated API names (`saNewDev…`) on paste. `canonicalize`, `sha256`, `uuid`, `nowIso` come from the existing `util.ts`.
+
+### 2.1 `src/specBuilders/onePagerSpec.ts` — the shared builder (R1–R5 live here)
+
+```typescript
+export const ONE_PAGER_SPEC_VERSION = "1.0";
+
+// THE single source of spec truth for workload 'one_pager'.
+// Returns an OBJECT (never a string) + the stable retention key.
+export async function buildOnePagerSpec(project: PlcProject): Promise<{
+  spec: object;
+  logicalReportKey: string;      // stable per subject — retention keeps latest N per key
+}> {
+  const onePagerText = project.onePagerText ?? "";
+  const spec = {
+    type: "one_pager",                        // == useCase == workload (WS-HARNESS §8 contract)
+    specVersion: ONE_PAGER_SPEC_VERSION,
+    projectId: project.projectId,
+    title: project.displayName ?? project.projectId,
+    asOfDate: isoDate(project.lastUpdatedAt), // YYYY-MM-DD — helper, not locale formatting
+    content: {
+      onePagerText,                           // the content payload — THIS is what makes
+      status: project.status ?? "",           // specHash a content hash (data change => new hash)
+    },
+  };
+  return { spec, logicalReportKey: `one_pager_${project.projectId}` };
+}
+```
+
+### 2.2 `src/dedupCore.ts` — one decision function, both actions call it (R3 lives here)
+
+```typescript
+// NOT registered as an action — internal shared core.
+// mode 'user':      HIT => DuplicateGeneratedReport copy for the requester (existing §1.3 behavior)
+// mode 'scheduled': HIT => zero edits (a scheduled run that finds the render does NOTHING)
+// Both modes:       error-status match or MISS => create pending ReportRequest
+export async function dedupCore(
+  useCase: string, spec: object, logicalReportKey: string,
+  mode: "user" | "scheduled", userId: string | null,
+): Promise<{ outcome: "hit_reused" | "hit_skipped" | "created"; specHash: string }> {
+  const specJson = canonicalize(spec);                 // the ONLY stringification point
+  const specHash = sha256(specJson);
+
+  const existing = await Objects.GeneratedReport
+    .where({ specHash, status: "complete" }).first();
+
+  if (existing) {
+    if (mode === "scheduled") return { outcome: "hit_skipped", specHash };
+    // user path: hand the requester their own row via the copy action (WS-PDF §1.3 / KB §02 [Q2])
+    await duplicateGeneratedReport(existing, uuid(), useCase, specHash);
+    return { outcome: "hit_reused", specHash };
+  }
+
+  const r = Edits.create.ReportRequest(uuid());        // MISS (or only error-status matches)
+  r.useCase = useCase; r.specJson = specJson; r.specHash = specHash;
+  r.logicalReportKey = logicalReportKey;
+  r.status = "pending"; r.trigger = mode === "scheduled" ? "scheduled" : "manual";
+  r.requestedBy = userId; r.requestedAt = nowIso(); r.lastStatusChangeAt = nowIso();
+  return { outcome: "created", specHash };
+}
+```
+
+(Refactor note: the existing `SubmitReportRequestWithDedup` becomes a thin caller of this core with `mode:'user'` — one code path, no drift.)
+
+### 2.3 `src/submitOnePagerReport.ts` — the user-facing wrapper action
+
+```typescript
+@OntologyEditFunction()   // register as action "[SA New Dev] Submit One Pager Report"
+export async function submitOnePagerReport(project: PlcProject, userId: string): Promise<void> {
+  const { spec, logicalReportKey } = await buildOnePagerSpec(project);   // R1: the shared builder
+  await dedupCore("one_pager", spec, logicalReportKey, "user", userId);
+}
+```
+
+Workshop's PDF button fires THIS action with the project object + current-user variable. The overlay then reads state off the request/report rows exactly as WS-PDF §4 already specifies — no frontend change beyond pointing the button at the wrapper.
+
+### 2.4 `src/runScheduledPdfPregenOnePager.ts` — the Automate entry point
+
+```typescript
+@OntologyEditFunction()   // register as action "[SA New Dev] Run Scheduled Pdf Pregen One Pager"
+export async function runScheduledPdfPregenOnePager(): Promise<void> {
+  const projects = await Objects.PlcProject.where({ status: "active" }).all();  // standing subjects
+  for (const p of projects) {
+    try {
+      const { spec, logicalReportKey } = await buildOnePagerSpec(p);   // SAME builder — R1
+      await dedupCore("one_pager", spec, logicalReportKey, "scheduled", null);
+    } catch (e) { /* skip subject whose spec can't build — never throw (batch must finish) */ }
+  }
+}
+```
+
+Unchanged subjects → `hit_skipped` → zero edits. If ALL subjects are unchanged, the `ReportRequest` dataset never updates and **no render build starts at all** — the free-run property.
+
+---
+
+## Part 3 — Automation configuration, click by click
+
+**Step A — Ontology Manager, actions (one-time).**
+1. Register `[SA New Dev] Submit One Pager Report` — function-backed → `submitOnePagerReport`; parameters `project` (object reference), `userId` (string).
+2. Register `[SA New Dev] Run Scheduled Pdf Pregen One Pager` — function-backed → `runScheduledPdfPregenOnePager`; **no parameters**.
+3. Timeout: the batch does queries + row-creates only (no LLM) — default 60s is fine up to ~dozens of subjects; raise it (Ontology Manager → Functions) if the subject count grows.
+
+**Step B — Automate rule `pdf-pregen-one-pager` (this is AU5 in WS-PDF §9.8).**
+1. New automation → **Time trigger** → cron `30 5 * * *` (nightly 05:30 UTC). Pick the time as: *your upstream data pipeline's worst-case finish + ≥30 min margin, and before working hours*. For a weekly workload (exec summary) use `0 5 * * 1` instead.
+2. Effect → **Apply action** → `[SA New Dev] Run Scheduled Pdf Pregen One Pager` (no parameters to map).
+3. Single-instance / no overlap if the option exists; enabled.
+
+**Step C — confirm the render schedule (already built, §3.1 / §9.7 — no change).**
+`render_one_pager_schedule`: **Data updated** trigger on the shared `ReportRequest` dataset → builds `render_one_pager_reports`, concurrency = serialize. This is what picks up the pregen rows. You are NOT adding a schedule to the transform — pre-gen only front-loads request rows.
+
+**Step D — retention guard (AU4 config check).**
+Open `pdf-stack-retention-one_pager` and confirm its archive criterion **keeps the latest N complete reports per `logicalReportKey`**. If it can archive the only complete render, every dedup hit dies and pre-gen becomes nightly churn.
+
+**Step E — repeat per workload.** New pre-gen workload = one builder file + one batch action + one AU5-style rule. Nothing shared changes.
+
+---
+
+## Part 4 — Acceptance canary (run after first setup and after ANY builder change)
+
+1. Fire the pregen action manually (action tester). Expect: one `pending` `ReportRequest` per active subject (`trigger='scheduled'`), the render build starts, PDFs reach `complete`.
+2. Fire it again immediately. Expect: **zero new rows** and **no build starts** (all `hit_skipped`).
+3. In Workshop, click the PDF button for any subject. Expect: **instant** — `hit_reused` (a duplicated report row for the user), overlay renders the PDF with **no loadscreen**, zero new renders.
+4. Change one project's one-pager data. Re-fire pregen. Expect: exactly **one** new request/render (that subject), all others skipped.
+5. Force one render to fail (bad payload). Next pregen run: expect that subject **resubmitted** (error-status match = MISS) — the self-heal property.
+
+If step 3 shows a loadscreen instead of an instant hit, the two paths are not hashing identically — go straight to R3/R4 (nine times out of ten: array ordering, rounding, or a date formatted two ways).
