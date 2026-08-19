@@ -1,0 +1,194 @@
+# RUNBOOK — Project Summary object + manual editor (no LLM)
+
+**What this builds:** the `[SA New Dev] Project Summary` object type and a Workshop page to view / write / save summaries by hand — for real projects (`iSTEP25B`, `iSTEP26B`) **and** arbitrary subjects (`program_cascade_reporting`). No Logic functions, no wrappers, no harness dependency. The AI layer (generate / revise / proposal cards) comes later and adds on top with zero rework.
+
+**Self-contained.** Everything needed is on this page. Sources of truth it was assembled from: WS-UC2 §1.1/§3, BUILD-ROADMAP §4b C1/C2/C4/C5/C6a. If this page and those ever disagree, those win — but as of 2026-08-02 they say the same thing.
+
+**Time:** ~1.5–2 h total. Naming convention reminder: display names `[SA New Dev] <Name>`, API names `saNewDev…` camelCase — substitute your generated API names when pasting code.
+
+---
+
+## STEP 1 — Backing dataset (seed transform, ~10 min)
+
+Add one output to `transforms/seed_backing_datasets.py` in the `harness-backing` repo and run the build once. Object Storage V2 layers all action edits on top of this empty dataset; re-running is harmless.
+
+```python
+PROJECT_SUMMARY_SCHEMA = T.StructType([
+    T.StructField("projectSummaryId", T.StringType(), False),   # PK; subject key — equals projectId
+                                                                # for projects, a slug otherwise
+    T.StructField("summaryText", T.StringType(), True),
+    T.StructField("charLimit", T.IntegerType(), True),
+    T.StructField("sourceMode", T.StringType(), True),          # manual | ai_generated | ai_edited
+    T.StructField("sourceInteractionId", T.StringType(), True), # null on manual saves
+    T.StructField("sourceOnePagerHash", T.StringType(), True),  # null on manual saves
+    T.StructField("lastSavedByUserId", T.StringType(), True),
+    T.StructField("firstSavedAt", T.TimestampType(), True),
+    T.StructField("lastSavedAt", T.TimestampType(), True),
+    T.StructField("version", T.IntegerType(), True),
+])
+
+@transform_df(Output("<project-path>/sa_new_dev_project_summary"))
+def seed_project_summary(ctx):
+    return ctx.spark_session.createDataFrame([], PROJECT_SUMMARY_SCHEMA)
+```
+
+---
+
+## STEP 2 — Ontology Manager: the object type (~15 min)
+
+Create a new object type over the Step-1 dataset:
+
+| Setting | Value |
+|---|---|
+| Display name | `[SA New Dev] Project Summary` (keep it project-agnostic — non-project rows live here too) |
+| API name | `saNewDevProjectSummary` |
+| Backing dataset | `sa_new_dev_project_summary` |
+| Primary key | `projectSummaryId` |
+| **Edit history** | **ON** (powers the history panel) |
+| **Action log** | **ON** (powers the Action Log Timeline) |
+
+Properties (map 1:1 from the dataset columns):
+
+| Property | Type | Meaning |
+|---|---|---|
+| `projectSummaryId` | string (PK) | **Subject key.** Projects: the real `projectId`. Arbitrary subjects: a slug (`program_cascade_reporting`) |
+| `summaryText` | string | the summary itself (markdown) |
+| `charLimit` | integer | per-row limit; the save function applies the default (600) on first save |
+| `sourceMode` | string | `manual` \| `ai_generated` \| `ai_edited` — manual saves write `manual` |
+| `sourceInteractionId` | string, nullable | AI provenance — **null for handwritten rows** |
+| `sourceOnePagerHash` | string, nullable | AI provenance — **null for handwritten rows** |
+| `lastSavedByUserId` | string | who saved last (passed explicitly — functions can't read the user) |
+| `firstSavedAt` | timestamp | set once, on the first save |
+| `lastSavedAt` | timestamp | every save |
+| `version` | integer | +1 per save |
+
+Then register the **FK link**: ProjectSummary → your project object type, mapping `projectSummaryId` → `projectId`, cardinality one-to-one. No join dataset (FK links never need one). **Subject generality:** for non-project rows the link simply resolves to nothing — Foundry links don't enforce integrity, so this is harmless and intended.
+
+---
+
+## STEP 3 — The save function (~20 min)
+
+New file in the `harness-actions` repo: `src/saveProjectSummary.ts`. Same imports and `nowIso()` helper as the existing CRUD file.
+
+```typescript
+const DEFAULT_CHAR_LIMIT = 600;   // same constant the module (and later the prompts) use
+const ALLOWED_MODES = ["manual", "ai_generated", "ai_edited"];
+
+@OntologyEditFunction()
+export async function saveProjectSummary(
+  projectSummaryId: string,             // subject key — real projectId for projects,
+                                        // a slug for arbitrary subjects
+  summaryText: string,
+  sourceMode: string,                   // 'manual' | 'ai_generated' | 'ai_edited'
+  sourceInteractionId: string | null,   // null on manual saves
+  sourceOnePagerHash: string | null,    // null on manual saves
+  userId: string,                       // explicit — functions can't read the acting user
+): Promise<void> {
+  if (!ALLOWED_MODES.includes(sourceMode)) throw new Error(`Invalid sourceMode ${sourceMode}`);
+  const text = (summaryText ?? "").trim();
+  if (!text) throw new Error("summaryText must be non-empty");
+
+  const existing = await Objects.SaNewDevProjectSummary
+    .where({ projectSummaryId }).first();
+  const limit = existing?.charLimit ?? DEFAULT_CHAR_LIMIT;
+  if (text.length > limit) throw new Error(`Summary is ${text.length} chars — limit is ${limit}`);
+
+  // Upsert: modify the row if it exists, create it (PK = subject key) if not.
+  const s = existing
+    ? await Edits.get.SaNewDevProjectSummary(projectSummaryId)
+    : Edits.create.SaNewDevProjectSummary(projectSummaryId);
+  if (!existing) { s.firstSavedAt = nowIso(); s.charLimit = limit; }
+  s.summaryText = text;
+  s.sourceMode = sourceMode;
+  s.sourceInteractionId = sourceInteractionId ?? null;
+  s.sourceOnePagerHash = sourceOnePagerHash ?? null;
+  s.lastSavedByUserId = userId;
+  s.lastSavedAt = nowIso();
+  s.version = (existing?.version ?? 0) + 1;
+}
+```
+
+Note: **this action throws on validation failure on purpose** (unlike the never-throwing generate wrappers) — save is a user-facing form action, and Workshop surfaces the thrown message right at the Save button.
+
+Commit → build → confirm the function publishes.
+
+---
+
+## STEP 4 — Register the action (~5 min)
+
+Ontology Manager → Action types → New:
+
+| Setting | Value |
+|---|---|
+| Display name | `[SA New Dev] Save Project Summary` (this is **A13** in the roadmap numbering) |
+| Backing | function-backed → `saveProjectSummary`, pin the version |
+| Parameters | auto-created from the function signature — no dropdown config needed (the page maps every parameter from variables; nothing is typed into a form) |
+| Submission criteria | none in dev (**no group gating**; structural checks live inside the function). Later: + 'iSTEP Leader' Skywise-group criterion — one addition, no redesign |
+
+---
+
+## STEP 5 — The Workshop page (~45 min)
+
+### 5a. Variables — create in this order
+
+**1. `subjectId`** — String. Filled by however you reach the page: a module parameter from the cockpit list's Edit button, or (for dev) a plain text-input widget writing into it. `iSTEP25B` and `program_cascade_reporting` are equally valid values.
+
+**2. `summaryRecordSet`** — Object set of `[SA New Dev] Project Summary`. From all objects, one filter: `projectSummaryId` **equals** variable `subjectId`. Always 0 or 1 rows.
+
+**3. `savedText`** — String, **derived from `summaryRecordSet`** by extracting the `summaryText` property. `[VERIFY]` your Workshop version has property-extraction variables; if not, the fallback is a 5-line read-only function returning the row's text (still zero LLM involvement).
+
+**4. `editMode`** — Boolean, default false.
+
+**5. `draftText`** — String, default empty.
+
+**6.** Confirm the built-in **current user** variable is available.
+
+### 5b. View section — visible when `editMode` is false AND `summaryRecordSet` is NOT empty
+
+- Markdown/text widget bound to `savedText`.
+- Meta line from the record's properties: `sourceMode` as a chip (✍️ manual / 🤖 AI-generated / ✍️🤖 AI-edited), `lastSavedByUserId`, `lastSavedAt`, `v{version}`.
+- **Edit** button. Events, in order: ① set `draftText` = `savedText` ② set `editMode` = true.
+
+### 5c. Empty section — visible when `editMode` is false AND `summaryRecordSet` IS empty
+
+- Text: "No summary yet for this entry."
+- **Start writing** button: ① set `draftText` = empty ② set `editMode` = true.
+
+### 5d. Edit section — visible when `editMode` is true
+
+- **Text area** bound to `draftText`, generous height.
+- Static note: "Limit: 600 characters — enforced on save." (A live counter needs a string-length derived variable — add it if your version offers one; enforcement doesn't depend on it.)
+- **Save** button — disabled while `draftText` is empty — applying action `[SA New Dev] Save Project Summary` with **no form**, parameters mapped:
+  - `projectSummaryId` ← variable `subjectId`
+  - `summaryText` ← variable `draftText`
+  - `sourceMode` ← static value `manual`
+  - `sourceInteractionId` ← leave empty / null
+  - `sourceOnePagerHash` ← leave empty / null
+  - `userId` ← current-user variable
+  - **On success:** ① refresh `summaryRecordSet` ② set `editMode` = false.
+  - On failure (empty / over limit): the thrown message appears at the button; you stay in edit mode.
+- **Cancel** button: set `editMode` = false (draft discarded).
+
+### 5e. History section — below, visible whenever the record exists
+
+- **Edit History** widget over the record.
+- **Action Log Timeline** widget over the record — every save is an A13 application, so this reads "who saved what, when" with zero extra config. (Both widgets work because Step 2 switched their toggles ON.)
+
+---
+
+## STEP 6 — Acceptance test (~5 min)
+
+| # | Do | Expect |
+|---|---|---|
+| 1 | Open with a fresh `subjectId` | Empty section shows |
+| 2 | Start writing → type → Save | View mode: your text, ✍️ manual, your user id, `v1` |
+| 3 | Edit → change → Save | `v2`, `lastSavedAt` updated |
+| 4 | Edit → paste 700 chars → Save | Readable error at the button ("Summary is 700 chars — limit is 600"), still editing |
+| 5 | Open with `program_cascade_reporting` | Same flow works — no project behind it, FK dangles harmlessly |
+| 6 | Check the history section | Edit History shows both versions; Action Log Timeline shows each save with user + time |
+
+---
+
+## What comes later (not this activity)
+
+The AI layer (**C6b**, BUILD-ROADMAP §4b): the single page reader `getProjectSummaryView`, ✦ Generate / ✨ Revise buttons, proposal cards with feedback thumbs, nightly snapshots. It adds widgets beside this editor and moves the `savedText` bindings onto the reader — nothing built here is thrown away.
