@@ -1,0 +1,335 @@
+# WS-WIDGET-OVERRIDE — Manual value overrides for Vega widgets
+
+**Status:** draft v0.1 | **Last updated:** 2026-08-02
+
+**What this is.** Two (eventually N) Workshop widgets render per-iSTEP numbers through Vega specs. Some of those numbers have no dynamic data connection, so authorized users paste values from a controlled sheet instead. This workstream is the generic override layer: **paste CSV → validate → persist in the ontology → widgets read overrides instead of source data when the toggle is on.**
+
+**Decisions locked (2026-08-02, user-confirmed):**
+- **Shared scope** — ONE override row per widget; every viewer sees the same overridden values.
+- **Per-widget CSV contract** — each row carries its own `expectedColumns`; one generic parser validates any paste against the row's contract. Widget #3 later = seed one row, zero code.
+- **Persisted toggle** — `overrideEnabled` lives on the row; editors flip it via action; consistent for all viewers, survives sessions.
+- **`string(JSON)` values, NOT a struct column** — struct columns have fixed schemas and cannot serve widgets with different value shapes (same reasoning as the harness payloads). Raw pasted CSV is stored alongside for editor round-trip.
+- **Validation failures throw.** Unlike the AI wrappers (catch-inside, because a failed generation must still leave a ledger row), a bad paste SHOULD fail the action: Workshop surfaces the message, nothing is written, the previous override survives untouched.
+- **Saving auto-enables** (`overrideEnabled=true`) — pasting is intent to use. Turning it off is an explicit toggle action.
+- **Contract-routed save (2026-08-02):** the controlling user keeps ONE workbook with two sheets (sheet 1 = Content Stability schema, sheet 2 = Quality schema). `SaveWidgetOverride` therefore takes **no `widgetKey`** — it matches the pasted headers against every registered contract and **updates every widget whose full contract is present** (a normal sheet paste matches exactly one; a combined table with all columns legitimately updates both). Headers matching no contract → error listing the registered contracts. Because an action is a single transaction, any validation error anywhere writes nothing to any widget. Editor gating is a **submission criterion on the action** (Current User ID in the editor list) — see the gating bullet below.
+- **Editor gating via SUBMISSION CRITERIA (v0.2, user-proposed, doc-verified):** Current User conditions can compare "a user's ID … against static lists" — **individual-user gating needs NO group** ([submission-criteria](https://www.palantir.com/docs/foundry/action-types/submission-criteria), KB §02). So: a criterion `Current User ID is one of [static editor list]` on `SaveWidgetOverride` / `SetWidgetOverrideEnabled` / `ClearWidgetOverride` is the enforcement layer; when the Skywise group exists, swap it to a group-membership criterion — one Ontology Manager edit, no code. UI visibility uses a **static string-list module variable `overrideEditors`** (condition: contains current user). The former `editorUserIds` property, its `UpdateWidgetOverrideEditors` action, the reader's `canEdit`, and the in-function check are all **deleted** — the criterion is the single hard gate. Two consequences to accept: the editor list is maintained in two configs (the criterion + the module variable — keep them in sync when it changes), and criteria gate **per action, not per widget** — one shared editor list covers both widgets (fine per §6.1; if per-widget lists ever matter, that's the one case where the in-function check pattern would come back).
+- **No harness integration.** No LLM anywhere in this loop → no `AIPInteraction`, no feedback, no evals. Plain CRUD.
+
+**Transparency caveat (deliberate, per requirement):** non-editors never see the OVERRIDDEN tag, so ordinary viewers cannot tell the numbers are manual. If that ever becomes a problem, move the tag outside the gated section (one drag) and keep only the Edit button gated.
+
+---
+
+## 1. Ontology — ONE new object type
+
+### 1.1 `[SA New Dev] Widget Override` (`saNewDevWidgetOverride`)
+
+| Property | Type | Required | Notes |
+|---|---|---|---|
+| `widgetKey` | string | yes | **PK.** Stable id per widget, e.g. `istep_cascade_metrics`, `istep_delivery_counts` |
+| `widgetLabel` | string | yes | Human name shown in the editor modal title |
+| `expectedColumns` | string array | yes | **The CSV contract.** Convention: **first entry = the subject key column (string, e.g. `iSTEP`); all others = numeric metric columns.** Seeded at registration |
+| `rawCsv` | string \| null | no | Exactly as pasted — round-trips into the editor for the next edit |
+| `valuesJson` | string \| null | no | **string(JSON):** array of row objects, e.g. `[{"iSTEP":"iSTEP25B","deliveries":41,"slippageDays":6}, …]` |
+| `overrideEnabled` | boolean | yes | The persisted toggle. Default false at registration |
+| `rowCount` | integer \| null | no | Parsed data rows |
+| `lastUpdatedByUserId` | string \| null | no | |
+| `lastUpdatedAt` | timestamp \| null | no | |
+| `version` | integer | yes | Increments per save |
+
+- **Edit history ON** (every paste is auditable — who replaced which numbers when), **action log ON**.
+- No links. `widgetKey` is referenced from Workshop as a static string per widget instance.
+
+### 1.2 Backing dataset — seed transform delta
+
+One more output in `transforms/seed_backing_datasets.py` (same pattern as every other type):
+
+```python
+WIDGET_OVERRIDE_SCHEMA = T.StructType([
+    T.StructField("widgetKey", T.StringType(), False),        # PK
+    T.StructField("widgetLabel", T.StringType(), True),
+    T.StructField("expectedColumns", T.ArrayType(T.StringType()), True),
+    T.StructField("rawCsv", T.StringType(), True),
+    T.StructField("valuesJson", T.StringType(), True),        # string(JSON)
+    T.StructField("overrideEnabled", T.BooleanType(), True),
+    T.StructField("rowCount", T.IntegerType(), True),
+    T.StructField("lastUpdatedByUserId", T.StringType(), True),
+    T.StructField("lastUpdatedAt", T.TimestampType(), True),
+    T.StructField("version", T.IntegerType(), True),
+])
+
+@transform_df(Output("<project-path>/sa_new_dev_widget_override"))
+def seed_widget_override(ctx):
+    return ctx.spark_session.createDataFrame([], WIDGET_OVERRIDE_SCHEMA)
+```
+
+---
+
+## 2. Actions — all function-backed, `userId` explicit (as everywhere)
+
+| # | Action | Backing function | Parameters | Purpose |
+|---|---|---|---|---|
+| W1 | `RegisterWidgetOverride` | `registerWidgetOverride` | `widgetKey`, `widgetLabel`, `expectedColumns[]`, `userId` | Seed one row per widget (run once per widget). Throws if the key exists |
+| W2 | `SaveWidgetOverride` | `saveWidgetOverride` | `csvText`, `userId` — **no widgetKey: contract-routed** | **The main path**: match pasted headers against all registered contracts → parse + validate → upsert every fully-matched widget. Auto-enables. **Submission criterion: Current User ID ∈ editor list** |
+| W3 | `SetWidgetOverrideEnabled` | `setWidgetOverrideEnabled` | `widgetKey`, `enabled`, `userId` | The persisted toggle. **Same criterion** |
+| W4 | `ClearWidgetOverride` | `clearWidgetOverride` | `widgetKey`, `userId` | Nulls `rawCsv`/`valuesJson`/`rowCount`, disables. Row + contract survive. **Same criterion** |
+
+### 2.1 `saveWidgetOverride` — full code (contract-routed; the parser IS the product)
+
+```typescript
+// saveWidgetOverride.ts — contract-routed save. The paste (from EITHER sheet of the controlled
+// workbook) is matched against every registered widget contract; every widget whose FULL contract
+// is present in the pasted headers gets updated. No widgetKey parameter.
+// Throws on ANY problem: the action is one transaction, so an error anywhere writes NOTHING —
+// previous overrides survive on every widget.
+@OntologyEditFunction()
+export async function saveWidgetOverride(csvText: string, userId: string): Promise<void> {
+  const lines = (csvText ?? "").trim().split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length < 2) throw new Error("Paste needs a header row plus at least one data row");
+
+  // Excel copy-paste is TAB-separated; fall back to ; then , for real CSV files
+  const sep = lines[0].includes("\t") ? "\t" : lines[0].includes(";") ? ";" : ",";
+  const norm = (s: string) => s.trim().toLowerCase();
+  const header = lines[0].split(sep).map(norm);
+
+  // ---- route: which registered widgets does this paste serve? ----
+  const registered = await Objects.WidgetOverride.all();          // tiny set
+  const matched = registered.filter(r =>
+    (r.expectedColumns ?? []).length >= 2 &&
+    (r.expectedColumns ?? []).every(c => header.includes(norm(c))));
+  if (matched.length === 0) {
+    const contracts = registered
+      .map(r => `${r.widgetKey}: [${(r.expectedColumns ?? []).join(", ")}]`).join("  ·  ");
+    throw new Error(`Headers match no registered widget. Registered contracts — ${contracts}`);
+  }
+
+  for (const row of matched) {
+    const expected = row.expectedColumns!;
+    const idx = expected.map(c => header.indexOf(norm(c)));       // order-insensitive; extra columns ignored
+    const keyCol = expected[0];                                   // convention: first = subject key (string)
+    const out: Record<string, string | number>[] = [];
+    const seen = new Set<string>();
+
+    for (let i = 1; i < lines.length; i++) {
+      const cells = lines[i].split(sep).map(c => c.trim());
+      const rec: Record<string, string | number> = {};
+      for (let j = 0; j < expected.length; j++) {
+        const raw = cells[idx[j]];
+        if (j === 0) {
+          if (raw === undefined || raw === "")
+            throw new Error(`Row ${i + 1}: '${keyCol}' is empty`);
+          if (seen.has(raw)) throw new Error(`Row ${i + 1}: duplicate ${keyCol} '${raw}'`);
+          seen.add(raw);
+          rec[keyCol] = raw;
+        } else {
+          // BLANK metric cells are LEGAL (sheet may be partially filled): omit the metric —
+          // the Vega merge keeps the source value for it (per-metric granularity, §5).
+          // A row that is all-blank except the key is legal too and overrides nothing.
+          if (raw === undefined || raw === "") continue;
+          // tolerate thousands spaces; tolerate decimal comma ONLY when comma isn't the separator
+          const cleaned = sep === "," ? raw.replace(/\s/g, "") : raw.replace(/\s/g, "").replace(",", ".");
+          const num = Number(cleaned);
+          if (!isFinite(num))
+            throw new Error(`Row ${i + 1} ('${row.widgetKey}'): '${expected[j]}' is not a number ('${raw}')`);
+          rec[expected[j]] = num;
+        }
+      }
+      out.push(rec);
+    }
+
+    const e = await Edits.get.WidgetOverride(row.widgetKey);
+    e.rawCsv = csvText;
+    e.valuesJson = JSON.stringify(out);
+    e.rowCount = out.length;
+    e.overrideEnabled = true;                                     // pasting implies intent to use
+    e.lastUpdatedByUserId = userId;
+    e.lastUpdatedAt = nowIso();
+    e.version = (e.version ?? 0) + 1;
+  }
+}
+```
+
+Routing semantics, spelled out: a sheet-1 paste (Project + MG columns) fully matches only `content_stability` → one row updated. A sheet-2 paste matches only `quality`. A combined table carrying all eleven columns matches both → **both updated from one paste** (legitimate, and visible — both tags flip). No match → error that teaches the user the contracts. Any error → nothing written anywhere.
+
+### 2.2 The small ones (sketches)
+
+```typescript
+@OntologyEditFunction()
+export async function registerWidgetOverride(
+  widgetKey: string, widgetLabel: string, expectedColumns: string[], userId: string,
+): Promise<void> {
+  const existing = await Objects.WidgetOverride.where({ widgetKey }).first();
+  if (existing) throw new Error(`'${widgetKey}' already registered`);
+  if (expectedColumns.length < 2) throw new Error("Contract needs key column + ≥1 metric column");
+  const e = Edits.create.WidgetOverride(widgetKey);
+  e.widgetLabel = widgetLabel; e.expectedColumns = expectedColumns;
+  e.overrideEnabled = false; e.version = 0;
+  e.lastUpdatedByUserId = userId; e.lastUpdatedAt = nowIso();
+}
+
+@OntologyEditFunction()
+export async function setWidgetOverrideEnabled(widgetKey: string, enabled: boolean, userId: string): Promise<void> {
+  const e = await Edits.get.WidgetOverride(widgetKey);
+  e.overrideEnabled = enabled; e.lastUpdatedByUserId = userId; e.lastUpdatedAt = nowIso();
+}
+
+@OntologyEditFunction()
+export async function clearWidgetOverride(widgetKey: string, userId: string): Promise<void> {
+  const e = await Edits.get.WidgetOverride(widgetKey);
+  e.rawCsv = null; e.valuesJson = null; e.rowCount = null; e.overrideEnabled = false;
+  e.lastUpdatedByUserId = userId; e.lastUpdatedAt = nowIso();
+  e.version = (e.version ?? 0) + 1;
+}
+```
+
+---
+
+## 3. The single reader — `getWidgetOverrideView`
+
+Same principle as `getGenerationView` / `getProjectSummaryView`: **one function-backed variable per widget instance is the only source of page state.** Flat scalars, verdicts computed server-side.
+
+```typescript
+@Function()  // read-only — not an action
+export async function getWidgetOverrideView(widgetKey: string): Promise<{
+  exists: boolean;            // row registered?
+  enabled: boolean;           // the persisted toggle
+  hasValues: boolean;         // valuesJson non-empty
+  rowCount: number;
+  rawCsv: string;             // editor prefill ("" when none)
+  valuesJson: string;         // handed onward to the Vega prep function
+  expectedColumnsCsv: string; // "iSTEP, deliveries, slippageDays" — modal help line
+  widgetLabel: string;
+  statusLine: string;         // ready-to-render tag text
+  lastUpdatedByUserId: string; lastUpdatedAt: string;
+}> {
+  const row = await Objects.WidgetOverride.where({ widgetKey }).first();
+  if (!row) return { exists: false, enabled: false, hasValues: false,
+    rowCount: 0, rawCsv: "", valuesJson: "", expectedColumnsCsv: "", widgetLabel: widgetKey,
+    statusLine: "Live source data", lastUpdatedByUserId: "", lastUpdatedAt: "" };
+  const hasValues = !!row.valuesJson;
+  const statusLine = row.overrideEnabled && hasValues
+    ? `OVERRIDDEN · ${row.rowCount} rows · ${row.lastUpdatedByUserId} · ${fmtWhen(row.lastUpdatedAt!)}`
+    : hasValues ? "Override saved but OFF — showing live source data"
+    : "Live source data";
+  return {
+    exists: true, enabled: !!row.overrideEnabled, hasValues,
+    rowCount: row.rowCount ?? 0, rawCsv: row.rawCsv ?? "", valuesJson: row.valuesJson ?? "",
+    expectedColumnsCsv: (row.expectedColumns ?? []).join(", "),
+    widgetLabel: row.widgetLabel ?? widgetKey, statusLine,
+    lastUpdatedByUserId: row.lastUpdatedByUserId ?? "", lastUpdatedAt: iso(row.lastUpdatedAt),
+  };
+}
+// fmtWhen / iso: same helpers as the other readers.
+```
+
+---
+
+## 4. Workshop configuration (runbook — per widget; repeat for widget 2 with a different `widgetKey`)
+
+**W1.** Create variable **`overrideView`** — function-backed → `getWidgetOverrideView`, input: `widgetKey` = the **static string** for this widget (e.g. `content_stability`).
+
+**W2.** Create variable **`csvDraft`** — String, default empty. And once per module: **`overrideEditors`** — static String-list variable holding the editor user ids (**keep in sync with the submission criterion's list** — the criterion enforces, this only shows/hides).
+
+**W3.** Next to the Vega widget, add a **section with visibility condition: `overrideEditors` contains the built-in current-user id.** Inside it, side by side:
+- a **tag/text widget** bound to `overrideView.statusLine` (this is the OVERRIDDEN indicator);
+- a **Button** labeled **Edit values** — on click, in order: set `csvDraft` = `overrideView.rawCsv` → open overlay `OverrideEditorOverlay`;
+- a **Button** whose label is conditional (`Use live data` when `overrideView.enabled`, `Use overrides` otherwise) — applies `SetWidgetOverrideEnabled` with `widgetKey` = the static string, `enabled` = NOT `overrideView.enabled`, `userId` = current user. Disabled while `overrideView.hasValues` is false. On success: refresh `overrideView`.
+
+**W4.** Create overlay **`OverrideEditorOverlay`**, size **XL** (the full-page modal). Contents, top to bottom:
+- Title text bound to `overrideView.widgetLabel`;
+- Help line (static): `Paste from the controlled workbook — sheet 1 (Content Stability: Project, MG3, MG5, MG7, MG9, MG11, MG13) or sheet 2 (Quality: Project, DQN - Overall, DQN - Target, RDR - Overall, RDR - Target). The right widget is detected from the headers.` (Update this text when a widget 3 registers);
+- A large **Text area** bound to `csvDraft` (~20 rows — this is where the sheet gets pasted; tab-separated Excel paste works as-is);
+- **Save** button — disabled while `csvDraft` is empty. Applies `SaveWidgetOverride`: `csvText` = `csvDraft`, `userId` = current user — **no widgetKey: the paste routes itself by headers** (a paste of the *other* sheet into this widget's overlay correctly updates the other widget). **On success:** refresh `overrideView` → clear `csvDraft` → close overlay. **On failure:** the action error (unmatched contract, bad number, duplicate project, not an editor) shows; the overlay stays open for correction;
+- **Clear override** button — applies `ClearWidgetOverride` (form with a confirm feel is optional); on success: refresh `overrideView`, close;
+- Cancel / X — close, clear `csvDraft`.
+
+**W5.** Nothing else on the page changes yet — the Vega widget keeps rendering source data until §5 is wired.
+
+---
+
+## 5. Vega wiring — LAST step (deliberately deferred)
+
+The existing data-prep function for each widget gains two inputs, fed from the same `overrideView` variable: `overrideValuesJson: string` and `overrideEnabled: boolean`. Inside, before building the Vega dataset:
+
+- if `overrideEnabled` is false or `overrideValuesJson` is empty → unchanged behavior;
+- else `JSON.parse` → array of records keyed by the subject column (first contract column) → **merge semantics: per-subject AND per-metric, scoped to the widget's own project set** — the prep function already knows which projects this widget renders, and that set is authoritative. For every in-scope project present in the override, **each metric present on its record replaces the source value; metrics absent from the record (blank cells in the paste) keep source values**. In-scope projects absent from the override keep everything; **override rows for projects OUTSIDE the widget's scope are silently ignored**.
+
+That last clause is what makes the **superset pasting model** (§5.1) safe — the paste always carries all projects; scoping is the prep function's job, never the parser's.
+
+### 5.1 Superset pasting model (user-specified, 2026-08-02)
+
+The controlled sheet lists the **superset of all projects** for editing simplicity. Both widgets' pastes carry every project; each widget's Vega prep then considers only its own project subset. Consequences, by design:
+- The parser validates **columns and numbers, never project membership** — unknown or out-of-scope project keys are legal in a paste and simply go unused by widgets that don't render them.
+- The two widgets keep **separate override rows and separate pastes** (their column contracts differ); only the *project rows* are the shared superset.
+- If garbage project keys ever become a problem, an optional membership check against the project object set can be added to `saveWidgetOverride` later — one lookup, not a redesign.
+
+---
+
+## 6. Configuration inventory
+
+| Where | What |
+|---|---|
+| Seed transform | +1 output `sa_new_dev_widget_override` (§1.2) |
+| Ontology Manager | Object type `[SA New Dev] Widget Override` (PK `widgetKey`, edit history ON, action log ON); 4 function-backed actions W1–W4; **submission criterion on W2/W3/W4: Current User ID is one of [editor list]** (swap to group membership when the Skywise group exists) |
+| TS repo | `widgetOverrideActions.ts` (§2), `readers/getWidgetOverrideView.ts` (§3) |
+| Seed data | 2 × `RegisterWidgetOverride` with the real contracts (§6.1). Editor list (TBD) goes into TWO configs: the submission criterion + the module's `overrideEditors` variable |
+
+### 6.1 The two registrations (user-specified, 2026-08-02)
+
+| Parameter | Registration 1 | Registration 2 |
+|---|---|---|
+| `widgetKey` | `content_stability` | `quality` |
+| `widgetLabel` | Content Stability | Quality |
+| `expectedColumns` | [`Project/Milestone`, `MG3`, `MG5`, `MG7`, `MG9`, `MG11`, `MG13`] | [`Project/Milestone`, `DQN-Overall`, `DQN-Target`, `RDR-Overall`, `RDR-Target`] |
+
+(Editors are NOT a registration parameter — the shared editor list lives in the W2/W3/W4 submission criterion + the module's `overrideEditors` variable.)
+
+Canonical paste examples (user-supplied 2026-08-02; tab-separated as Excel copies it, arbitrary number of project rows):
+
+```
+Project/Milestone	MG3	MG5	MG7	MG9	MG11	MG13
+iSTEP25B	10	10	10	10	10	10
+iSTEP26B	10	10	10	10	10	10
+```
+
+```
+Project/Milestone	DQN-Overall	DQN-Target	RDR-Overall	RDR-Target
+iSTEP25B				
+iSTEP26B				
+```
+
+- The second example is deliberately **blank in every metric cell — legal**: blank = "not overridden", per-metric (§5). A save of an all-blank sheet succeeds and overrides nothing until cells are filled.
+- Key header `Project/Milestone` (slash fine) and hyphenated names (`DQN-Overall`) just have to match the contract verbatim, case-insensitive, trimmed.
+
+### 6.2 Initial configuration & scaling — the contract lives in DATA, not schema
+
+**Where the schema expectation lives:** `expectedColumns` is a **property value on each row** — the object type itself is completely widget-agnostic and is never touched again after C-day one. Registering widget N is a data operation, not ontology work.
+
+**Initial configuration** = fire `RegisterWidgetOverride` (W1) once per widget. Two equally valid ways:
+1. **Action form from Ontology Manager / Object Explorer** — fine for the first two.
+2. **A Workshop "Register widget" button** (recommended once scaling starts): a button in the editors' gated area configured as apply-action-with-form on W1 — `userId` prefilled hidden; `widgetKey`, `widgetLabel`, `expectedColumns` (string-list parameter renders as a multi-entry input; enter the sheet headers in order, key column first) editable in the form. Submitting the form IS the configuration.
+
+**Adding a widget tomorrow — four steps, zero code, zero ontology changes:**
+1. Submit the W1 form (key, label, its sheet's headers).
+2. Copy the per-widget Workshop block (§4): 2 variables + gated section + Edit/toggle buttons — change only the static `widgetKey` string; the paste overlay is shared already (routing by headers).
+3. Update the overlay's static help line with the new sheet's columns.
+4. Wire the new widget's Vega prep per §5.
+| Workshop | Per widget: `overrideView` + `csvDraft` variables, gated section (tag + Edit + toggle), `OverrideEditorOverlay` (§4) |
+| Vega prep functions | +2 inputs each, merge per §5 — last step |
+
+## 7. Build order
+
+1. Seed transform delta → build. 2. Object type + 5 actions in Ontology Manager. 3. TS repo: actions + reader → publish. 4. Fire `RegisterWidgetOverride` twice (real contracts). 5. Workshop per §4 (widget 1, then copy for widget 2 — only the static `widgetKey` differs). 6. Test loop below. 7. §5 Vega wiring.
+
+**Test loop:** as an allowlisted user: section visible, tag reads "Live source data" → Edit values → paste sheet 1 → Save → Content Stability's tag flips to "OVERRIDDEN · N rows · you · now" → **routing test:** from Content Stability's overlay, paste sheet 2 → Save → *Quality's* tag flips, Content Stability's untouched → toggle Use live data → tag shows "saved but OFF" → toggle back → paste a broken sheet (wrong headers, a text value, duplicate project) → each rejected with a precise message, previous values intact everywhere → Clear → back to "Live source data". As a non-allowlisted user: no section, no tag, no buttons — and a direct call of Save/Toggle/Clear is refused by the **submission criterion** (the hard gate; the hidden section is only cosmetics).
+
+## 8. Open items
+
+- [x] Widget contracts specified with real headers (§6.1): key column `Project/Milestone`; `content_stability` (MG3…MG13); `quality` (DQN-Overall/-Target, RDR-Overall/-Target). Canonical paste examples captured; blank metric cells legal (per-metric merge).
+- [ ] **Supply the editor user-id list** (one shared list; goes into the W2/W3/W4 submission criterion AND the module's `overrideEditors` variable — keep the two in sync).
+- [ ] `[VERIFY]` once: submission-criteria config renders identically on our function-backed actions (KB §02 notes parity isn't explicitly documented).
+- [ ] Later (prod): replace/augment `editorUserIds` with the Skywise group check — one visibility condition + optionally one submission criterion on W2/W3/W4.
+- [ ] Decide post-v1 whether the OVERRIDDEN tag should be visible to all viewers (transparency) — one-drag change.
+
+## Related
+- [WS-HARNESS.md](WS-HARNESS.md) — the string(JSON) payload rationale and single-reader pattern this reuses.
+- [WS-UC2.md](WS-UC2.md) — sibling example of the reader + action-events state model.
